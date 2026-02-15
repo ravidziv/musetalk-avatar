@@ -8,7 +8,7 @@ FINETUNED_DIR="/app/models/finetuned"
 MARKER="$MODELS_DIR/.downloaded"
 
 # HuggingFace repo for fine-tuned weights (set via env or default)
-HF_FINETUNED_REPO="${HF_FINETUNED_REPO:-ravidsh/musetalk-ravid}"
+HF_FINETUNED_REPO="${HF_FINETUNED_REPO:-ravid/musetalk-ravid}"
 
 # Download models only on first cold start (or if marker missing)
 if [ ! -f "$MARKER" ]; then
