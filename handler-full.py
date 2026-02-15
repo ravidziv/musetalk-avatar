@@ -9,6 +9,7 @@ import sys
 import copy
 import base64
 import tempfile
+import time
 import runpod
 import numpy as np
 import cv2
@@ -27,11 +28,13 @@ FINETUNED_UNET_PATH = os.environ.get(
 # Global model instances
 musetalk_model = None
 avatar_cache = {}
+startup_time = time.time()
+init_error = None
 
 
 def initialize_model():
     """Initialize MuseTalk model once on cold start."""
-    global musetalk_model
+    global musetalk_model, init_error
 
     if musetalk_model is not None:
         return musetalk_model
@@ -44,6 +47,17 @@ def initialize_model():
         # Change to MuseTalk dir so relative model paths work
         os.chdir(MUSETALK_PATH)
 
+        # Check what model files exist
+        models_dir = os.path.join(MUSETALK_PATH, "models")
+        print(f"Models directory: {models_dir}")
+        print(f"Models dir exists: {os.path.exists(models_dir)}")
+        if os.path.exists(models_dir):
+            for root, dirs, files in os.walk(models_dir):
+                for f in files:
+                    fpath = os.path.join(root, f)
+                    fsize = os.path.getsize(fpath) / (1024*1024)
+                    print(f"  {os.path.relpath(fpath, models_dir)}: {fsize:.1f} MB")
+
         from musetalk.utils.utils import load_all_model
         from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
         from musetalk.utils.blending import get_image
@@ -54,7 +68,7 @@ def initialize_model():
 
         if device.type == "cuda":
             print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-            print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+            print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.2f} GB")
 
         # Load MuseTalk models — returns (vae, unet, pe)
         print("Loading MuseTalk models...")
@@ -104,6 +118,7 @@ def initialize_model():
         print(f"Error initializing model: {e}")
         import traceback
         traceback.print_exc()
+        init_error = str(e)
         musetalk_model = {"mock": True, "device": "cpu", "error": str(e)}
         return musetalk_model
 
@@ -425,7 +440,29 @@ def handler(event):
 
         print(f"Handler: action={action}, avatar_id={avatar_id}")
 
-        if action == "prepare":
+        if action == "status":
+            import torch
+            gpu_info = {}
+            if torch.cuda.is_available():
+                gpu_info = {
+                    "name": torch.cuda.get_device_name(0),
+                    "memory_total_gb": round(torch.cuda.get_device_properties(0).total_mem / 1e9, 2),
+                    "memory_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
+                    "memory_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
+                }
+            return {
+                "status": "ok",
+                "uptime_seconds": round(time.time() - startup_time, 1),
+                "model_loaded": musetalk_model is not None,
+                "model_mode": "real" if (musetalk_model and not musetalk_model.get("mock")) else "mock",
+                "init_error": init_error,
+                "gpu": gpu_info,
+                "avatars_cached": list(avatar_cache.keys()),
+                "finetuned_weights": os.path.exists(FINETUNED_UNET_PATH),
+                "models_dir_exists": os.path.exists(os.path.join(MUSETALK_PATH, "models")),
+            }
+
+        elif action == "prepare":
             image_b64 = job_input.get("image_base64", "")
             if not image_b64:
                 return {"error": "image_base64 is required for prepare action"}
@@ -442,7 +479,7 @@ def handler(event):
             return result
 
         else:
-            return {"error": f"Unknown action: {action}"}
+            return {"error": f"Unknown action: {action}. Valid actions: status, prepare, generate"}
 
     except Exception as e:
         print(f"Handler error: {e}")
@@ -453,7 +490,11 @@ def handler(event):
 
 # Initialize on import (cold start optimization)
 print("Starting MuseTalk handler...")
-initialize_model()
+try:
+    initialize_model()
+except Exception as e:
+    print(f"WARNING: Model initialization failed: {e}")
+    print("Handler will run in mock mode")
 
 # RunPod serverless entrypoint
 runpod.serverless.start({"handler": handler})
