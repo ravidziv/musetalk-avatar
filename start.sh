@@ -78,26 +78,25 @@ except Exception as e:
     print('Will retry on first request')
 " || echo "InsightFace download skipped (will retry on first request)"
 
-    # 4. Fine-tuned UNet weights
-    echo "[4/4] Downloading fine-tuned weights..."
-    if [ ! -f "$FINETUNED_DIR/unet_finetuned.pth" ]; then
-        python3 -c "
+    # 4. Fine-tuned UNet weights + avatar cache
+    echo "[4/5] Downloading fine-tuned weights..."
+    python3 -c "
 from huggingface_hub import hf_hub_download
-import sys
-try:
-    path = hf_hub_download(
-        repo_id='$HF_FINETUNED_REPO',
-        filename='unet_finetuned.pth',
-        local_dir='$FINETUNED_DIR'
-    )
-    print(f'Fine-tuned weights downloaded to {path}')
-except Exception as e:
-    print(f'Could not download fine-tuned weights: {e}', file=sys.stderr)
-    print('Will use pretrained MuseTalk v1.5 instead')
+import sys, os
+repo = '$HF_FINETUNED_REPO'
+out_dir = '$FINETUNED_DIR'
+os.makedirs(out_dir, exist_ok=True)
+for fname in ['unet_finetuned.pth', 'avatar_cache.pkl']:
+    local = os.path.join(out_dir, fname)
+    if os.path.exists(local):
+        print(f'{fname} already present, skipping')
+        continue
+    try:
+        path = hf_hub_download(repo_id=repo, filename=fname, local_dir=out_dir)
+        print(f'Downloaded {fname} to {path}')
+    except Exception as e:
+        print(f'Could not download {fname}: {e}', file=sys.stderr)
 "
-    else
-        echo "Fine-tuned weights already present."
-    fi
 
     # Final disk check
     echo "Disk space after downloads:" && df -h /app 2>/dev/null || df -h /

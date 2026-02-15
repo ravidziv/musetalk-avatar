@@ -1,6 +1,7 @@
 """
 Full MuseTalk RunPod Serverless Handler
 Real lip-sync avatar generation using MuseTalk v1.5 with fine-tuned weights.
+Uses pre-computed avatar cache (no mmpose needed at runtime).
 """
 
 import os
@@ -10,6 +11,7 @@ import copy
 import base64
 import tempfile
 import time
+import pickle
 import runpod
 import numpy as np
 import cv2
@@ -23,6 +25,12 @@ sys.path.insert(0, MUSETALK_PATH)
 FINETUNED_UNET_PATH = os.environ.get(
     "FINETUNED_UNET_PATH",
     "/app/models/finetuned/unet_finetuned.pth"
+)
+
+# Pre-computed avatar cache path
+AVATAR_CACHE_PATH = os.environ.get(
+    "AVATAR_CACHE_PATH",
+    "/app/models/finetuned/avatar_cache.pkl"
 )
 
 # Global model instances
@@ -56,19 +64,28 @@ def initialize_model():
                 for f in files:
                     fpath = os.path.join(root, f)
                     fsize = os.path.getsize(fpath) / (1024*1024)
-                    print(f"  {os.path.relpath(fpath, models_dir)}: {fsize:.1f} MB")
+                    if fsize > 1:  # Only show files > 1MB
+                        print(f"  {os.path.relpath(fpath, models_dir)}: {fsize:.1f} MB")
 
         from musetalk.utils.utils import load_all_model
-        from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
-        from musetalk.utils.blending import get_image
+        from musetalk.utils.blending import get_image as _get_image_orig
         from musetalk.whisper.audio2feature import Audio2Feature
+
+        # Simple face parsing replacement (no separate model needed)
+        def simple_face_parse(image, mode="raw"):
+            """Return a white mask — blend entire face region."""
+            return Image.new('L', image.size, 255)
+
+        def get_image(image, face, face_box, **kwargs):
+            """Wrapper that injects our simple face parser."""
+            return _get_image_orig(image, face, face_box, fp=simple_face_parse, **kwargs)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
         if device.type == "cuda":
             print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-            print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.2f} GB")
+            print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
 
         # Load MuseTalk models — returns (vae, unet, pe)
         print("Loading MuseTalk models...")
@@ -105,13 +122,14 @@ def initialize_model():
             "pe": pe,
             "audio_processor": audio_processor,
             "timesteps": timesteps,
-            "get_landmark_and_bbox": get_landmark_and_bbox,
-            "read_imgs": read_imgs,
-            "coord_placeholder": coord_placeholder,
             "get_image": get_image,
         }
 
         print("MuseTalk model initialized successfully")
+
+        # Load pre-computed avatar cache
+        load_avatar_cache()
+
         return musetalk_model
 
     except Exception as e:
@@ -123,8 +141,38 @@ def initialize_model():
         return musetalk_model
 
 
-def prepare_avatar(image_data: bytes, avatar_id: str) -> dict:
-    """Prepare avatar image — extract face, compute latents."""
+def load_avatar_cache():
+    """Load pre-computed avatar data from pickle file."""
+    global avatar_cache
+
+    if os.path.exists(AVATAR_CACHE_PATH):
+        print(f"Loading pre-computed avatar cache from {AVATAR_CACHE_PATH}")
+        try:
+            with open(AVATAR_CACHE_PATH, 'rb') as f:
+                data = pickle.load(f)
+
+            avatar_cache["default"] = {
+                "frame_list": data["frame_list"],
+                "coord_list": data["coord_list"],
+                "input_latent_list": [lat.cuda() if hasattr(lat, 'cuda') else lat
+                                      for lat in data["input_latent_list"]],
+                "image": data["frame_list"][0],
+                "width": data["frame_list"][0].shape[1],
+                "height": data["frame_list"][0].shape[0],
+                "mock": False,
+            }
+            print(f"Avatar cache loaded: {len(data['coord_list'])} frames, "
+                  f"latent shape: {data['input_latent_list'][0].shape}")
+        except Exception as e:
+            print(f"Error loading avatar cache: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"No avatar cache at {AVATAR_CACHE_PATH}")
+
+
+def prepare_avatar_simple(image_data: bytes, avatar_id: str) -> dict:
+    """Prepare avatar from image using insightface (no mmpose needed)."""
     global avatar_cache, musetalk_model
 
     model = initialize_model()
@@ -132,86 +180,82 @@ def prepare_avatar(image_data: bytes, avatar_id: str) -> dict:
 
     image = Image.open(io.BytesIO(image_data)).convert("RGB")
     image_np = np.array(image)
+    frame_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
     if model.get("mock", True):
         avatar_cache[avatar_id] = {
-            "image": image_np,
+            "image": frame_bgr,
             "width": image.width,
             "height": image.height,
             "mock": True,
         }
         return {
             "avatar_id": avatar_id,
-            "width": image.width,
-            "height": image.height,
             "status": "prepared",
             "mode": "mock",
         }
 
     try:
         import torch
+        from insightface.app import FaceAnalysis
 
         vae = model["vae"]
-        get_landmark_and_bbox = model["get_landmark_and_bbox"]
-        coord_placeholder = model["coord_placeholder"]
 
-        # Save temp image for face detection
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            image.save(f.name)
-            temp_path = f.name
+        # Detect face with insightface
+        app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        app.prepare(ctx_id=0)
+        faces = app.get(frame_bgr)
 
-        try:
-            # Extract face landmarks and bounding box
-            coord_list, frame_list = get_landmark_and_bbox([temp_path], 0)
-            if len(coord_list) == 0:
-                raise ValueError("No face detected in image")
+        if not faces:
+            raise ValueError("No face detected in image")
 
-            # Pre-compute VAE latents for each frame (masked + ref concat)
-            input_latent_list = []
-            for bbox, frame in zip(coord_list, frame_list):
-                if bbox == coord_placeholder:
-                    continue
-                x1, y1, x2, y2 = bbox
-                crop_frame = frame[y1:y2, x1:x2]
-                crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
-                latents = vae.get_latents_for_unet(crop_frame)
-                input_latent_list.append(latents)
+        face = faces[0]
+        bbox = face.bbox.astype(int)
+        x1, y1, x2, y2 = bbox
 
-            avatar_cache[avatar_id] = {
-                "image": image_np,
-                "frame_list": frame_list,
-                "coord_list": coord_list,
-                "input_latent_list": input_latent_list,
-                "width": image.width,
-                "height": image.height,
-                "mock": False,
-            }
+        # Expand bbox (similar to MuseTalk's landmark-based expansion)
+        w, h = x2 - x1, y2 - y1
+        pad_x = int(w * 0.2)
+        pad_top = int(h * 0.3)
+        pad_bottom = int(h * 0.1)
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_top)
+        x2 = min(frame_bgr.shape[1], x2 + pad_x)
+        y2 = min(frame_bgr.shape[0], y2 + pad_bottom)
 
-            return {
-                "avatar_id": avatar_id,
-                "width": image.width,
-                "height": image.height,
-                "status": "prepared",
-                "mode": "real",
-            }
+        coord = (x1, y1, x2, y2)
+        crop = frame_bgr[y1:y2, x1:x2]
+        crop_resized = cv2.resize(crop, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+        latents = vae.get_latents_for_unet(crop_resized)
 
-        finally:
-            os.unlink(temp_path)
+        avatar_cache[avatar_id] = {
+            "image": frame_bgr,
+            "frame_list": [frame_bgr],
+            "coord_list": [coord],
+            "input_latent_list": [latents],
+            "width": image.width,
+            "height": image.height,
+            "mock": False,
+        }
+
+        return {
+            "avatar_id": avatar_id,
+            "status": "prepared",
+            "mode": "real",
+        }
 
     except Exception as e:
         print(f"Error preparing avatar: {e}")
         import traceback
         traceback.print_exc()
         avatar_cache[avatar_id] = {
-            "image": image_np,
+            "image": frame_bgr,
             "width": image.width,
             "height": image.height,
             "mock": True,
         }
         return {
             "avatar_id": avatar_id,
-            "width": image.width,
-            "height": image.height,
             "status": "prepared",
             "mode": "mock",
             "error": str(e),
@@ -226,19 +270,23 @@ def generate_frames(audio_data: bytes, avatar_id: str) -> dict:
 
     # Get or create avatar
     if avatar_id not in avatar_cache:
-        print(f"Avatar {avatar_id} not found, using default")
-        default_avatar_path = "/app/avatar.jpg"
-        if os.path.exists(default_avatar_path):
-            with open(default_avatar_path, "rb") as f:
-                prepare_avatar(f.read(), avatar_id)
+        # Try default avatar
+        if "default" in avatar_cache:
+            avatar_id = "default"
         else:
-            placeholder = np.ones((512, 512, 3), dtype=np.uint8) * 200
-            avatar_cache[avatar_id] = {
-                "image": placeholder,
-                "width": 512,
-                "height": 512,
-                "mock": True,
-            }
+            # Load from image file
+            default_avatar_path = "/app/avatar.jpg"
+            if os.path.exists(default_avatar_path):
+                with open(default_avatar_path, "rb") as f:
+                    prepare_avatar_simple(f.read(), avatar_id)
+            else:
+                placeholder = np.ones((512, 512, 3), dtype=np.uint8) * 200
+                avatar_cache[avatar_id] = {
+                    "image": placeholder,
+                    "width": 512,
+                    "height": 512,
+                    "mock": True,
+                }
 
     avatar = avatar_cache[avatar_id]
 
@@ -270,7 +318,10 @@ def generate_mock_frames(audio_data: bytes, avatar: dict) -> dict:
     if base_image.shape[0] != target_size or base_image.shape[1] != target_size:
         base_image = cv2.resize(base_image, (target_size, target_size))
 
-    frame_bgr = cv2.cvtColor(base_image, cv2.COLOR_RGB2BGR)
+    if len(base_image.shape) == 3 and base_image.shape[2] == 3:
+        frame_bgr = base_image  # already BGR from cv2
+    else:
+        frame_bgr = base_image
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         video_path = f.name
@@ -329,7 +380,6 @@ def generate_real_frames(audio_data: bytes, avatar: dict, model: dict) -> dict:
         whisper_chunks = audio_processor.feature2chunks(
             feature_array=whisper_feature, fps=25
         )
-        # Convert numpy chunks to tensors
         whisper_chunks = [torch.from_numpy(c).float().to(device) for c in whisper_chunks]
 
         print(f"Generated {len(whisper_chunks)} audio chunks")
@@ -359,17 +409,14 @@ def generate_real_frames(audio_data: bytes, avatar: dict, model: dict) -> dict:
         print("Running inference...")
         with torch.no_grad():
             for batch_idx, (whisper_batch, latent_batch) in enumerate(gen):
-                # Positional encoding on audio features
                 audio_emb = pe(whisper_batch)
                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
 
-                # UNet forward: [masked_latent, ref_latent] + audio → predicted latent
                 pred_latents = unet.model(
                     latent_batch, timesteps,
                     encoder_hidden_states=audio_emb
                 ).sample
 
-                # Decode predicted latents back to BGR images
                 recon = vae.decode_latents(pred_latents)
                 for frame in recon:
                     res_frame_list.append(frame)
@@ -446,7 +493,7 @@ def handler(event):
             if torch.cuda.is_available():
                 gpu_info = {
                     "name": torch.cuda.get_device_name(0),
-                    "memory_total_gb": round(torch.cuda.get_device_properties(0).total_mem / 1e9, 2),
+                    "memory_total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2),
                     "memory_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
                     "memory_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
                 }
@@ -459,7 +506,7 @@ def handler(event):
                 "gpu": gpu_info,
                 "avatars_cached": list(avatar_cache.keys()),
                 "finetuned_weights": os.path.exists(FINETUNED_UNET_PATH),
-                "models_dir_exists": os.path.exists(os.path.join(MUSETALK_PATH, "models")),
+                "avatar_cache_exists": os.path.exists(AVATAR_CACHE_PATH),
             }
 
         elif action == "prepare":
@@ -467,7 +514,7 @@ def handler(event):
             if not image_b64:
                 return {"error": "image_base64 is required for prepare action"}
             image_data = base64.b64decode(image_b64)
-            return prepare_avatar(image_data, avatar_id)
+            return prepare_avatar_simple(image_data, avatar_id)
 
         elif action == "generate":
             audio_b64 = job_input.get("audio_base64", "")
@@ -479,7 +526,7 @@ def handler(event):
             return result
 
         else:
-            return {"error": f"Unknown action: {action}. Valid actions: status, prepare, generate"}
+            return {"error": f"Unknown action: {action}. Valid: status, prepare, generate"}
 
     except Exception as e:
         print(f"Handler error: {e}")
